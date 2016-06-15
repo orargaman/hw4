@@ -26,9 +26,9 @@
 #define READ_CHUNK_SIZE 20
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Omri&Or");
-static ssize_t device_read(struct file *, char * buffer, size_t n, loff_t *);
-static ssize_t device_write(struct file *, const char* buffer, size_t n, loff_t *);
-int ioctl(struct inode *inode, struct file *filp, unsigned int cmd, unsigned long arg);
+ ssize_t device_read(struct file *, char * buffer, size_t n, loff_t *);
+ ssize_t device_write(struct file *, const char* buffer, size_t n, loff_t *);
+int device_ioctl(struct inode *inode, struct file *filp, unsigned int cmd, unsigned long arg);
 int init_module(void);
 void cleanup_module(void);
 
@@ -46,13 +46,13 @@ struct file_operations fops = {
 	.read = device_read,
 	.write = device_write,
 	.llseek = NULL,
-	.ioctl = ioctl,
+	.ioctl = device_ioctl,
 	.owner = THIS_MODULE,
 };
 
 char entropy_pool[POOL_SIZE];
 int entropy_count=0;
-wait_queue_head_t wait_list;
+DECLARE_WAIT_QUEUE_HEAD(wait_list);
 
 int init_module(void)
 {	
@@ -61,7 +61,7 @@ int init_module(void)
 	int retval = register_chrdev(62,"srandom",&fops);
 	if (retval < 0)
 		return retval;
-	DECLARE_WAIT_QUEUE_HEAD(wait_list);
+	
 	for (i = 0; i < POOL_SIZE; i++) {
 		entropy_pool[i] = 0;
 	}
@@ -83,7 +83,8 @@ static int device_release(struct inode *, struct file *) {
 }
 */
 
-static ssize_t device_read(struct file * flip, char * buffer, size_t n, loff_t * f_pos) {
+
+ ssize_t device_read(struct file * flip, char * buffer, size_t n, loff_t * f_pos) {
 	if (n == 0) {
 		return 0;
 	}
@@ -93,8 +94,10 @@ static ssize_t device_read(struct file * flip, char * buffer, size_t n, loff_t *
 	while (entropy_count < 8) {
 		wait_event_interruptible(wait_list, entropy_count >= 8);
 	}
-	if (signal_pending(current) != 0)
+	if (signal_pending(current) != 0) {
 		return -ERESTARTSYS;
+	}
+		
 
 	int E = entropy_count / 8;
 	if (n > E) {
@@ -112,26 +115,30 @@ static ssize_t device_read(struct file * flip, char * buffer, size_t n, loff_t *
 		
 		hash_pool(entropy_pool, tmp);
 		mix(tmp, READ_CHUNK_SIZE, entropy_pool);
-		retval = copy_to_user(buffer +i*READ_CHUNK_SIZE, tmp, READ_CHUNK_SIZE);
+		retval = copy_to_user(buffer, tmp, READ_CHUNK_SIZE);
 		if (retval > 0) { 
 			kfree(tmp);
 			return -EFAULT;
 		}
+		buffer += READ_CHUNK_SIZE;
 	}
-	hash_pool(entropy_pool, tmp);
-	mix(tmp, READ_CHUNK_SIZE, entropy_pool);
-	retval = copy_to_user(buffer + i*READ_CHUNK_SIZE, tmp, last_size);
-	if (retval > 0) {
-		kfree(tmp);
-		return -EFAULT;
+	if (last_size != 0) {
+		hash_pool(entropy_pool, tmp);
+		mix(tmp, READ_CHUNK_SIZE, entropy_pool);
+		retval = copy_to_user(buffer, tmp, last_size);
+		if (retval > 0) {
+			kfree(tmp);
+			return -EFAULT;
+		}
 	}
+	
 	kfree(tmp);
 
 	
 	return n;
 
 }
-static ssize_t device_write(struct file * flip, const char* buffer, size_t n, loff_t * f_pos) {
+ ssize_t device_write(struct file * flip, const char* buffer, size_t n, loff_t * f_pos) {
 	if (buffer == NULL) {
 		return -EFAULT;
 	}
@@ -139,7 +146,7 @@ static ssize_t device_write(struct file * flip, const char* buffer, size_t n, lo
 	int last_size = n % WRITE_CHUNK_SIZE;
 	int retval = 0;
 	int i;
-	/*check hw4*/
+
 	char* chunk = kmalloc(n, GFP_KERNEL);
 	if (chunk == NULL) {
 		return -ENOMEM;
@@ -156,7 +163,9 @@ static ssize_t device_write(struct file * flip, const char* buffer, size_t n, lo
 	kfree(chunk);
 	return n;
 }
-int ioctl(struct inode *inode, struct file *filp, unsigned int cmd, unsigned long arg) {
+
+
+int device_ioctl(struct inode *inode, struct file *filp, unsigned int cmd, unsigned long arg) {
 
 	switch (cmd) {
 	case RNDGETENTCNT:
@@ -197,7 +206,12 @@ int rndclearpool() {
 int rndaddentropy(struct rand_pool_info *p) {	int retval = capable(CAP_SYS_ADMIN);
 	if (retval == 0) {
 		return -EPERM;
-	}	struct rand_pool_info* tmp_info = kmalloc(sizeof(struct rand_pool_info), GFP_KERNEL);	if (p == NULL || p->buf == NULL) {		return -EFAULT;	}	if (tmp_info->entropy_count < 0) {		return -EINVAL;	}	retval = 0;	/*check hw4 what if we can not read buf_size*/	retval =device_write(NULL,(char*)(p->buf),(size_t) p->buf_size, NULL);	if (retval < 0) {		return retval;	}		entropy_count += tmp_info->entropy_count;	/*ADD hw4 add signal wake  VV*/	if (entropy_count > 4096) {		entropy_count = 4096;	}		wake_up_interruptible(&wait_list);	kfree(tmp_info);	return 0;}/*
+	}	struct rand_pool_info* tmp_p = kmalloc(sizeof(struct rand_pool_info), GFP_KERNEL);	if (tmp_p==NULL) {
+		return -ENOMEM;
+	}	if (copy_from_user(tmp_p, p, sizeof(struct rand_pool_info)) != 0) {
+		kfree(tmp_p);
+		return -EFAULT;
+	}	if (tmp_p->entropy_count < 0 || tmp_p->buf_size<=0) {		kfree(tmp_p);		return -EINVAL;	}	retval = 0;	retval =device_write(NULL,(char*)(p->buf),(size_t) p->buf_size, NULL);	if (retval < 0) {		kfree(tmp_p);		return retval;	}		entropy_count += p->entropy_count;	if (entropy_count > 4096) {		entropy_count = 4096;	}		wake_up_interruptible(&wait_list);		kfree(tmp_p);	return 0;}/*
 * Public Domain SHA-1 implementation by Steve Reid <steve@edmweb.com>
 *
 * Taken from:
